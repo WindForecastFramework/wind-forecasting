@@ -428,16 +428,29 @@ class MLTuningObjective:
             self.log_gpu_stats(stage=f"Trial {trial.number} After Training")
             
             try:
-                # BUGFIX: Instead of using best_model_path (which may point to a previous trial's model),
-                # check if last_model_path is available - which should be from the current trial
+                # BUGFIX: Always use the last checkpoint saved from the CURRENT trial for evaluation
+                # Find ModelCheckpoint callbacks in the trainer
+                checkpoint_callbacks = [cb for cb in train_output.trainer.callbacks
+                                       if isinstance(cb, ModelCheckpoint)]
+                
+                if not checkpoint_callbacks:
+                    logging.error(f"Trial {trial.number} - No ModelCheckpoint callbacks found in trainer!")
+                    raise optuna.exceptions.TrialPruned(f"Trial {trial.number}: No ModelCheckpoint callbacks found")
                 if hasattr(train_output.trainer.checkpoint_callback, 'last_model_path') and train_output.trainer.checkpoint_callback.last_model_path:
                     checkpoint_path = train_output.trainer.checkpoint_callback.last_model_path
                     logging.info(f"Trial {trial.number} - Using last checkpoint for current trial evaluation: {checkpoint_path}")
                 else:
-                    # Fall back to best_model_path if last_model_path is not available
-                    checkpoint_path = train_output.trainer.checkpoint_callback.best_model_path
-                    logging.warning(f"Trial {trial.number} - No last_model_path available. Using best_model_path: {checkpoint_path}")
-                    logging.warning(f"Trial {trial.number} - WARNING: This may reference a previous trial's checkpoint!")
+                    for i, cb in enumerate(checkpoint_callbacks):
+                        if hasattr(cb, 'last_model_path') and cb.last_model_path:
+                            checkpoint_path = cb.last_model_path
+                            logging.info(f"Trial {trial.number} - Using last checkpoint from callback #{i+1}: {checkpoint_path}")
+                            break
+                    else:
+                        checkpoint_path = train_output.trainer.checkpoint_callback.best_model_path
+                        logging.warning(f"Trial {trial.number} - Could not find last_model_path in any callback, falling back to best_model_path: {checkpoint_path}")
+                        logging.warning(f"Trial {trial.number} - WARNING: This may reference a previous trial's checkpoint!")
+                
+                logging.info(f"Trial {trial.number} - Loading checkpoint from: {checkpoint_path}")
                 
                 # Ensure checkpoint exists before loading
                 if not os.path.exists(checkpoint_path):
@@ -496,7 +509,17 @@ class MLTuningObjective:
                 logging.error(f"Trial {trial.number} - Error extracting hyperparameters: {str(e)}", exc_info=True)
                 raise optuna.exceptions.TrialPruned(f"Error extracting hyperparameters in trial {trial.number}: {str(e)}")
 
-            logging.info(f"Re-instantiating LightningModule for metric retrieval with stage: {init_args.get('stage')}")
+            # Determine what stage the model was in when the checkpoint was saved to check if for tactis is stage 1 or 2
+            saved_stage = init_args.get('stage', 1)
+            
+            # Look for copula components in state_dict to detect Stage 2
+            has_copula_components = any('copula' in key for key in checkpoint['state_dict'].keys())
+            if has_copula_components and saved_stage == 1:
+                logging.info(f"Trial {trial.number} - Detected copula components in checkpoint but stage is set to 1. Updating to stage 2.")
+                saved_stage = 2
+                init_args['stage'] = 2
+            
+            logging.info(f"Re-instantiating LightningModule for metric retrieval with stage: {saved_stage}")
             logging.debug(f"Using init_args: {init_args}")
 
             # Instantiate model and load state dict with specific error handling
