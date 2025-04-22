@@ -1,7 +1,7 @@
 experiment:
   username: jmb0507
   project_name: wind_forecasting_flasc
-  run_name: tune_p8_d5_b100_n4 # [p = patience, d = min_delta, b = limit_train_batches, n = n_startup_trials]
+  run_name: tune_p5_d25_b100_n4 # [p = patience, d = min_delta, b = limit_train_batches, n = n_startup_trials]
   project_root: /user/taed7566/Forecasting/wind-forecasting
   log_dir: /user/taed7566/Forecasting/wind-forecasting/logs/
   notes: "Tuning FLASC with TACTiS-2"
@@ -22,7 +22,7 @@ optuna:
   n_trials_per_worker: 25     # Test a total of 4*25=100 trials - 25 good
   # ~3 min/epoch = 2.5 hours per trial = ~10 days for 100 trials / 4 workers = 2.5 days (with 100 batches no pruning)
   max_epochs: 25              # epochs per trial - 25 good
-  limit_train_batches: 100    # batches per epoch (large number to use all data) - 250 good
+  limit_train_batches: 50    # batches per epoch (large number to use all data) - 250 good
   metric: "val_loss"          # The metric to optimize (NLL)
   direction: "minimize"       # Whether to minimize or maximize the metric
 
@@ -192,14 +192,14 @@ callbacks:
     progress_bar:
       class_path: lightning.pytorch.callbacks.TQDMProgressBar
       init_args:
-        refresh_rate: 50  # every n steps, set to 0 to disable - 25 good
+        refresh_rate: 0  # every n steps, set to 0 to disable - 50 good
         leave: true
     early_stopping:
       class_path: lightning.pytorch.callbacks.EarlyStopping
       init_args:
         monitor: 'val_loss'
-        patience: 8 # Number of epochs to wait before stopping (val>epochs to disable) - 8 good
-        min_delta: 5.0 # Minimum change to be considered an improvement (>5.0 after observing visual fluctuations of 2-4 per epoch on an almost-perfectly visual plateau) - 5.0 good
+        patience: 5 # Number of epochs to wait before stopping (val>epochs to disable) - 8 good
+        min_delta: 25.0 # Minimum change to be considered an improvement (>5.0 after observing visual fluctuations of 2-4 per epoch on an almost-perfectly visual plateau) - 5.0 good
         mode: 'min'
         check_finite: true
     model_checkpoint:
