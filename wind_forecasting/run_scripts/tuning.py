@@ -233,34 +233,61 @@ class MLTuningObjective:
         self.config["model"][self.model].update({k: v for k, v in params.items() if k in self.config["model"][self.model]})
         self.config["trainer"].update({k: v for k, v in params.items() if k in self.config["trainer"]})
 
-        # Start with an empty list for this trial's specific callbacks
-        current_callbacks = []
+
+        trial_callbacks = [] # Start with an empty list for this trial
 
         # Add pruning callback if enabled
+        trial_pruning_callback = None # Initialize
         if self.pruning_enabled:
-            # Create the SAFE wrapper for the PyTorch Lightning pruning callback
-            # Read the metric to monitor from the config
-            pruning_monitor_metric = self.config.get("trainer", {}).get("monitor_metric", "val_loss") # Default to val_loss if not specified
-            pruning_callback = SafePruningCallback(
-                trial,
-                monitor=pruning_monitor_metric
-            )
-            current_callbacks.append(pruning_callback)
+            pruning_monitor_metric = self.config.get("trainer", {}).get("monitor_metric", "val_loss")
+            trial_pruning_callback = SafePruningCallback(trial, monitor=pruning_monitor_metric)
+            trial_callbacks.append(trial_pruning_callback)
+            logging.info(f"Added pruning callback for trial {trial.number}, monitoring '{pruning_monitor_metric}'")
 
-            logging.info(f"Added pruning callback for trial {trial.number}, monitoring '{pruning_monitor_metric}' (Optuna objective metric: '{pruning_monitor_metric}')")
+        # Instantiate trial-specific ModelCheckpoint
+        checkpoint_config = self.config['callbacks']['model_checkpoint']['init_args']
+        filename_template = checkpoint_config.get('filename', '{epoch}-{step}-{val_loss:.2f}')
+        # Ensure unique filename per trial
+        trial_filename = f"trial_{trial.number}_" + filename_template
         
-        logging.info(f"Trial {trial.number}: Using ModelCheckpoint defined in main YAML configuration via trainer_kwargs")
+        # Resolve checkpoint directory path
+        resolved_checkpoint_dir = resolve_path(
+            self.config['experiment']['project_root'], 
+            checkpoint_config.get('dirpath', self.config['logging']['checkpoint_dir'])
+        )
+        if not resolved_checkpoint_dir:
+             raise ValueError("Could not resolve checkpoint directory path.")
 
-        trial_trainer_kwargs = {k: v for k, v in self.config["trainer"].items() if k != 'callbacks'}
+        trial_checkpoint_callback = ModelCheckpoint(
+            dirpath=resolved_checkpoint_dir,
+            filename=trial_filename,
+            monitor=checkpoint_config.get('monitor', 'val_loss'),
+            mode=checkpoint_config.get('mode', 'min'),
+            save_top_k=checkpoint_config.get('save_top_k', 1),
+            save_last=checkpoint_config.get('save_last', True) # Keep save_last if needed
+            # Add any other relevant args from checkpoint_config here if necessary
+        )
+        trial_callbacks.append(trial_checkpoint_callback)
+        logging.info(f"Trial {trial.number}: Created specific ModelCheckpoint: {trial_checkpoint_callback} saving to {resolved_checkpoint_dir}/{trial_filename}")
 
+        # Add other callbacks from config, EXCLUDING ModelCheckpoint
         instantiated_callbacks_from_config = self.config.get("callbacks", [])
         if not isinstance(instantiated_callbacks_from_config, list) or not all(isinstance(cb, pl.Callback) for cb in instantiated_callbacks_from_config):
-             logging.warning("Callbacks in config are not a list of instantiated pl.Callback objects. Reverting to empty list.")
+             logging.warning("Callbacks in config are not a list of instantiated pl.Callback objects. Ignoring them for this trial.")
              instantiated_callbacks_from_config = []
+        
+        for cb in instantiated_callbacks_from_config:
+            if not isinstance(cb, ModelCheckpoint):
+                trial_callbacks.append(cb)
+            else:
+                logging.info(f"Trial {trial.number}: Skipping pre-instantiated ModelCheckpoint from config.")
 
-        final_callbacks = instantiated_callbacks_from_config + current_callbacks
+        logging.info(f"Trial {trial.number}: Final callbacks list: {[type(cb).__name__ for cb in trial_callbacks]}")
+        # --- End Callback Preparation ---
 
-        trial_trainer_kwargs["callbacks"] = final_callbacks
+        # Prepare trainer_kwargs, ensuring it uses the trial-specific callbacks
+        trial_trainer_kwargs = {k: v for k, v in self.config["trainer"].items() if k != 'callbacks'}
+        trial_trainer_kwargs["callbacks"] = trial_callbacks
         logging.debug(f"Final callbacks passed to estimator: {[type(cb).__name__ for cb in trial_trainer_kwargs['callbacks']]}")
 
         # Remove monitor_metric if it exists, as it's handled by ModelCheckpoint
@@ -358,8 +385,8 @@ class MLTuningObjective:
             "use_lazyframe": False,
             "batch_size": self.config["dataset"].get("batch_size", 128),
             "num_batches_per_epoch": trial_trainer_kwargs["limit_train_batches"], # Use value from trial_trainer_kwargs
-            "train_sampler": ExpectedNumInstanceSampler(num_instances=1.0, min_past=self.config["dataset"]["context_length"], min_future=self.data_module.prediction_length),
-            "validation_sampler": ValidationSplitSampler(min_past=self.config["dataset"]["context_length"], min_future=self.data_module.prediction_length),
+            "train_sampler": ExpectedNumInstanceSampler(num_instances=1.0, min_past=context_length, min_future=self.data_module.prediction_length), # Use calculated context_length
+            "validation_sampler": ValidationSplitSampler(min_past=context_length, min_future=self.data_module.prediction_length), # Use calculated context_length
             "time_features": [second_of_minute, minute_of_hour, hour_of_day, day_of_year],
             # Include distr_output initially, will be removed conditionally
             "distr_output": self.distr_output_class(dim=self.data_module.num_target_vars, **self.config["model"]["distr_output"]["kwargs"]),
@@ -387,6 +414,8 @@ class MLTuningObjective:
 
         agg_metrics = None
         train_output = None # Initialize train_output
+        best_model_path_for_eval = None # Initialize path variable
+        best_score_for_return = None # Initialize score variable
 
         try:
             try:
@@ -401,14 +430,10 @@ class MLTuningObjective:
             # Conditionally Create Forecast Generator
             try:
                 if self.model == 'tactis':
-                    # TACTiS uses SampleForecastGenerator internally for prediction
-                    # because its foweard pass returns samples not distribution parameters
                     logging.info(f"Trial {trial.number}: Using SampleForecastGenerator for TACTiS model.")
                     forecast_generator = SampleForecastGenerator()
                 else:
-                    # Other models use DistributionForecastGenerator based on their distr_output
                     logging.info(f"Trial {trial.number}: Using DistributionForecastGenerator for {self.model} model.")
-                    # Ensure estimator has distr_output before accessing
                     if not hasattr(estimator, 'distr_output'):
                          raise AttributeError(f"Estimator for model '{self.model}' is missing 'distr_output' attribute needed for DistributionForecastGenerator.")
                     forecast_generator = DistributionForecastGenerator(estimator.distr_output)
@@ -447,49 +472,29 @@ class MLTuningObjective:
             # Log GPU stats after training
             self.log_gpu_stats(stage=f"Trial {trial.number} After Training")
             
-            # --- Evaluation Logic (Mostly Unchanged) ---
-            # Load Predictor from Checkpoint (using best available path)
+            # --- Retrieve Best Path and Score Directly from Trial's Checkpoint Callback ---
+            if trial_checkpoint_callback:
+                best_model_path_for_eval = trial_checkpoint_callback.best_model_path
+                best_score_for_return = trial_checkpoint_callback.best_model_score
+                logging.info(f"Trial {trial.number}: Retrieved directly from trial's ModelCheckpoint - Path: {best_model_path_for_eval}, Score: {best_score_for_return}")
+            else:
+                logging.error(f"Trial {trial.number}: Trial-specific ModelCheckpoint callback not found after training. Cannot retrieve best path/score.")
+                raise optuna.exceptions.TrialPruned(f"Trial {trial.number} failed: Checkpoint callback missing post-training.")
+
+            if not best_model_path_for_eval:
+                 logging.warning(f"Trial {trial.number}: best_model_path from trial's ModelCheckpoint is empty or None. Using last_model_path if available.")
+                 if hasattr(trial_checkpoint_callback, 'last_model_path') and trial_checkpoint_callback.last_model_path:
+                      best_model_path_for_eval = trial_checkpoint_callback.last_model_path
+                      logging.info(f"Trial {trial.number}: Using last_model_path for evaluation: {best_model_path_for_eval}")
+                 else:
+                      logging.error(f"Trial {trial.number}: No best or last checkpoint path found in trial's ModelCheckpoint. Cannot proceed with evaluation.")
+                      raise optuna.exceptions.TrialPruned(f"Trial {trial.number} failed: No checkpoint path found.")
+
+            # --- Evaluation Logic (Using retrieved best_model_path_for_eval) ---
             predictor = None # Initialize predictor
-            monitor_metric = self.config.get("trainer", {}).get("monitor_metric", "val_loss")
-            checkpoint_callback = None
-            # Find the ModelCheckpoint callback that monitored the target metric
-            if train_output and hasattr(train_output, 'trainer') and hasattr(train_output.trainer, 'callbacks'):
-                for cb in train_output.trainer.callbacks:
-                    # Check if it's a ModelCheckpoint instance and monitors the correct metric
-                    if isinstance(cb, ModelCheckpoint) and hasattr(cb, 'monitor') and cb.monitor == monitor_metric:
-                        checkpoint_callback = cb
-                        break # Found the relevant checkpoint callback
-            else:
-                logging.error(f"Trial {trial.number}: train_output or trainer or callbacks not available after training. Cannot load predictor.")
-                raise optuna.exceptions.TrialPruned(f"Training output structure invalid in trial {trial.number}")
-
-            best_model_path_for_eval = None
-            if checkpoint_callback and hasattr(checkpoint_callback, 'best_model_path') and checkpoint_callback.best_model_path:
-                best_model_path_for_eval = checkpoint_callback.best_model_path
-                logging.info(f"Trial {trial.number}: Found best model checkpoint path for evaluation: {best_model_path_for_eval}")
-            else:
-                logging.warning(f"Trial {trial.number}: Could not find best_model_path in ModelCheckpoint callback for metric '{monitor_metric}'. Attempting fallback.")
-                # Fallback logic (try last_model_path or any other checkpoint)
-                fallback_path = None
-                for cb in train_output.trainer.callbacks:
-                     if isinstance(cb, ModelCheckpoint) and hasattr(cb, 'last_model_path') and cb.last_model_path:
-                          fallback_path = cb.last_model_path
-                          logging.warning(f"Trial {trial.number}: Using last_model_path as fallback for evaluation: {fallback_path}")
-                          break
-                     elif isinstance(cb, ModelCheckpoint) and hasattr(cb, 'best_model_path') and cb.best_model_path:
-                           fallback_path = cb.best_model_path
-                           logging.warning(f"Trial {trial.number}: Using best_model_path from another ModelCheckpoint as fallback for evaluation: {fallback_path}")
-                           break
-                if fallback_path:
-                    best_model_path_for_eval = fallback_path
-                else:
-                    logging.error(f"Trial {trial.number}: No checkpoint path found in any ModelCheckpoint callback. Cannot proceed with evaluation.")
-                    raise optuna.exceptions.TrialPruned(f"Could not find any checkpoint path for evaluation in trial {trial.number}")
-
-            # Load predictor using the determined path
             try:
                 loaded_module = self.lightning_module_class.load_from_checkpoint(
-                    best_model_path_for_eval,
+                    best_model_path_for_eval, # Use the path retrieved directly
                 )
                 logging.info(f"Trial {trial.number}: Successfully loaded LightningModule state from {best_model_path_for_eval} for evaluation.")
                 transformation = estimator.create_transformation()
@@ -572,60 +577,30 @@ class MLTuningObjective:
             gc.collect()
             logging.info(f"Trial {trial.number} - Cleanup attempt finished.")
 
-        # --- Return Best Metric Logic ---
+        # --- Return Best Metric Logic (Using retrieved best_score_for_return) ---
         metric_to_return = self.config.get("trainer", {}).get("monitor_metric", "val_loss")
-        optuna_direction = self.config.get("optuna", {}).get("direction", "minimize") # Not used here, but good practice
         metric_value = None
-        best_score = None # Initialize best_score for error logging
-
-        # Check if training completed and produced output
-        if train_output is None or not hasattr(train_output, 'trainer') or not hasattr(train_output.trainer, 'callbacks'):
-            error_msg = f"Trial {trial.number} - Training did not complete successfully or train_output structure is invalid. Cannot retrieve best score."
-            logging.error(error_msg)
-            raise optuna.exceptions.TrialPruned(f"Trial {trial.number} failed: {error_msg}")
 
         try:
-            # Find the ModelCheckpoint callback instance that monitored the target metric
-            target_checkpoint_callback = None
-            for cb in train_output.trainer.callbacks:
-                if isinstance(cb, ModelCheckpoint) and hasattr(cb, 'monitor') and cb.monitor == metric_to_return:
-                    target_checkpoint_callback = cb
-                    logging.info(f"Trial {trial.number}: Found ModelCheckpoint callback monitoring '{metric_to_return}'.")
-                    break
-
-            if target_checkpoint_callback is None:
-                error_msg = f"Could not find ModelCheckpoint callback monitoring '{metric_to_return}'."
-                logging.error(f"Trial {trial.number} - {error_msg}")
-                raise optuna.exceptions.TrialPruned(f"Trial {trial.number} failed: {error_msg}")
-
-            # Check if the callback has the best_model_score attribute
-            if not hasattr(target_checkpoint_callback, 'best_model_score'):
-                error_msg = f"ModelCheckpoint callback for '{metric_to_return}' does not have 'best_model_score' attribute."
-                logging.error(f"Trial {trial.number} - {error_msg}")
-                raise optuna.exceptions.TrialPruned(f"Trial {trial.number} failed: {error_msg}")
-
-            # Retrieve the best score
-            best_score = target_checkpoint_callback.best_model_score
-
-            if best_score is None:
+            if best_score_for_return is None:
                 # This might happen if no validation epoch completed successfully or the metric wasn't logged
-                error_msg = f"'best_model_score' from ModelCheckpoint for '{metric_to_return}' is None."
+                error_msg = f"'best_model_score' from trial's ModelCheckpoint for '{metric_to_return}' is None."
                 logging.error(f"Trial {trial.number} - {error_msg}")
                 raise optuna.exceptions.TrialPruned(f"Trial {trial.number} failed: {error_msg}")
 
             # Convert to float (handles tensors, numpy arrays, etc.)
-            if hasattr(best_score, 'item'):
-                metric_value = float(best_score.item())
-            elif isinstance(best_score, (np.ndarray, torch.Tensor)) and best_score.size == 1:
-                metric_value = float(best_score.item())
+            if hasattr(best_score_for_return, 'item'):
+                metric_value = float(best_score_for_return.item())
+            elif isinstance(best_score_for_return, (np.ndarray, torch.Tensor)) and best_score_for_return.size == 1:
+                metric_value = float(best_score_for_return.item())
             else:
-                metric_value = float(best_score) # Try direct conversion
+                metric_value = float(best_score_for_return) # Try direct conversion
 
-            logging.info(f"Trial {trial.number} - Returning best score '{metric_to_return}' from ModelCheckpoint to Optuna: {metric_value}")
+            logging.info(f"Trial {trial.number} - Returning best score '{metric_to_return}' from trial's ModelCheckpoint to Optuna: {metric_value}")
             return metric_value
 
         except (TypeError, ValueError) as e:
-             error_msg = f"Error converting best_model_score (value: {best_score}) for metric '{metric_to_return}' to float: {e}"
+             error_msg = f"Error converting best_model_score (value: {best_score_for_return}) for metric '{metric_to_return}' to float: {e}"
              logging.error(f"Trial {trial.number} - {error_msg}", exc_info=True)
              raise optuna.exceptions.TrialPruned(f"Trial {trial.number} failed: {error_msg}")
         except optuna.exceptions.TrialPruned as e: # Re-raise TrialPruned explicitly
