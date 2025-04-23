@@ -127,6 +127,7 @@ class SafePruningCallback(pl.Callback):
 
     # Delegate the relevant callback method(s)
     def on_validation_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+        logging.info(f"DEBUG: SafePruningCallback.on_validation_end called for trial {self.optuna_pruning_callback._trial.number}, step {trainer.global_step}")
         # Call the corresponding method on the wrapped Optuna callback
         self.optuna_pruning_callback.on_validation_end(trainer, pl_module)
 
@@ -562,6 +563,14 @@ class MLTuningObjective:
                 # If logger wasn't assigned but a run exists on rank 0, try finishing it.
                 logging.warning(f"Rank 0: wandb_logger_trial was None, but an active W&B run ('{wandb.run.name}') was found. Attempting to finish.")
                 wandb.finish()
+            # Explicit cleanup attempt between trials
+            logging.info(f"Trial {trial.number} - Attempting cleanup...")
+            if torch.cuda.is_available():
+                logging.info(f"Trial {trial.number} - Clearing CUDA cache.")
+                torch.cuda.empty_cache()
+            logging.info(f"Trial {trial.number} - Triggering garbage collection.")
+            gc.collect()
+            logging.info(f"Trial {trial.number} - Cleanup attempt finished.")
 
         # --- Return Best Metric Logic ---
         metric_to_return = self.config.get("trainer", {}).get("monitor_metric", "val_loss")
